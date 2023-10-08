@@ -2,7 +2,7 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const { config } = require('dotenv');
 const { initializeApp } = require('firebase/app');
-const { getFirestore, setDoc, doc } = require('firebase/firestore');
+const { getFirestore, doc, setDoc, collection, getDocs, addDoc, getDoc } = require('firebase/firestore');
 const { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, sendPasswordResetEmail, updateProfile } = require('firebase/auth');
 
 // Carrega as variáveis de ambiente do arquivo .env
@@ -112,31 +112,56 @@ app.post('/api/v1/auth/reset-password', async (req, res) => {
 });
 
 // Rota para enviar dados ao Firestore do usuário
-app.post('/api/v1/data-receive', async (req, res) => {
-  const { userId, accessToken, MS, UA, TP, RL, S1, S2 } = req.body;
+app.post('/api/v1/realtime/data-receive', async (req, res) => {
+  const { userId, accessToken, MS, UA, TP, RL, S1, S2, RG } = req.body;
 
-  if (!userId || !accessToken || !MS || !UA || !TP || !RL || !S1 || !S2) {
+  if (!userId || !accessToken || !MS || !UA || !TP || !RL || !S1 || !S2 || RG === undefined) {
     return res.status(400).json({ error: 'Todos os campos são obrigatórios' });
   }
 
   try {
-    // Adiciona os dados ao documento do dispositivo no Firestore
-    const deviceDocRef = doc(firestore, 'usuarios', userId, 'dispositivos', accessToken);
+    const dadosDocRef = doc(firestore, 'usuarios', userId, 'dispositivos', accessToken, 'dados', 'tempoReal');
 
-    await setDoc(deviceDocRef, {
+    const dataToUpdate = {
       MS,
       UA,
       TP,
       RL,
       S1,
       S2
-    }, { merge: true });
+    };
+
+    // Verifica se o documento "dados" já existe
+    const dadosDoc = await getDoc(dadosDocRef);
+
+    // Se o documento "dados" não existir, cria o documento
+    if (!dadosDoc.exists()) {
+      await setDoc(dadosDocRef, {});
+    }
+
+    // Adiciona ou atualiza os dados no documento "dados"
+    await setDoc(dadosDocRef, dataToUpdate, { merge: true });
+
+    // Se RG é verdadeiro, cria a coleção "alertas" e adiciona subdocumentos "irrigacao"
+    if (RG === 'true') {
+      const alertasCollectionRef = collection(firestore, 'usuarios', userId, 'dispositivos', accessToken, 'dados');
+      const irrigacaoDocRef = doc(alertasCollectionRef, 'alertas');
+
+      // Adiciona subdocumento com timestamp
+      const newSubdocRef = await addDoc(collection(irrigacaoDocRef, 'irrigacao'), {
+        timestamp: Date.now(),
+        mensagem: 'Irrigação realizada'
+      });
+
+      console.log('Novo subdocumento de irrigação adicionado:', newSubdocRef.id);
+    }
 
     res.sendStatus(200);
   } catch (error) {
     console.error('Erro ao salvar dados do dispositivo:', error);
     res.status(500).json({ message: 'Erro interno do servidor' });
   }
+
 });
 
 app.listen(PORT, () => {
