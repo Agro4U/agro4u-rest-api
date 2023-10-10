@@ -2,8 +2,10 @@ const express = require('express');
 const bodyParser = require('body-parser');
 const { config } = require('dotenv');
 const { initializeApp } = require('firebase/app');
-const { getFirestore, doc, setDoc, collection, getDocs, addDoc, getDoc } = require('firebase/firestore');
-const { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, sendPasswordResetEmail, updateProfile } = require('firebase/auth');
+const { getDatabase, ref, set, get, push } = require('firebase/database');
+const { getAuth, createUserWithEmailAndPassword, sendPasswordResetEmail, updateProfile, signInWithEmailAndPassword, getUserByEmail } = require('firebase/auth');
+const admin = require('firebase-admin');
+const serviceAccount = require('./serviceAccount/serviceAccountKey.json');
 
 // Carrega as variáveis de ambiente do arquivo .env
 config();
@@ -21,8 +23,13 @@ const firebaseConfig = {
   appId: process.env.FIREBASE_APP_ID
 };
 
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+  databaseURL: 'https://seu-projeto-id.firebaseio.com', // Substitua pelo URL do seu banco de dados
+});
+
 const firebaseApp = initializeApp(firebaseConfig);
-const firestore = getFirestore(firebaseApp);
+const database = getDatabase(firebaseApp);
 const auth = getAuth(firebaseApp);
 
 // Middleware para analisar solicitações JSON
@@ -32,49 +39,87 @@ app.use(bodyParser.json());
 app.post('/api/v1/auth/login', async (req, res) => {
   const { email, password } = req.body;
 
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Todos os campos são obrigatórios' });
+  }
+
   try {
     // Autenticar usuário no Firebase
-    await signInWithEmailAndPassword(auth, email, password);
+    const userCredential = await signInWithEmailAndPassword(auth, email, password);
+    const user = userCredential.user;
 
-    // Obtém informações do usuário autenticado
-    const user = auth.currentUser;
+    // Buscar dados do usuário no Realtime Database usando o UID como identificador
+    const userSubCollectionRef = ref(database, `usuarios/${user.uid}/dispositivos`);
+    const userSubCollectionSnapshot = await get(userSubCollectionRef);
 
-    res.json({ message: 'Login bem-sucedido', user });
+    let userData = [];
+
+    if (userSubCollectionSnapshot.exists()) {
+      userSubCollectionSnapshot.forEach((childSnapshot) => {
+        userData.push({ device: childSnapshot.key, data: childSnapshot.val() });
+      });
+    }
+
+    if (userData.length > 0) {
+      res.json({ message: 'Login bem-sucedido', userData }); // user
+    } else {
+      res.status(404).json({ message: 'Dados do usuário não encontrados' });
+    }
   } catch (error) {
     console.error('Erro ao autenticar usuário:', error);
     res.status(401).json({ message: 'Credenciais inválidas' });
   }
 });
 
-// Rota de registro
+// Rota para registrar usuário e criar estrutura inicial no Realtime Database
 app.post('/api/v1/auth/register', async (req, res) => {
-  const { email, password, name } = req.body;
+  const { email, password, name, accessToken } = req.body;
+
+  if (!email || !password || !name || !accessToken) {
+    return res.status(400).json({ error: 'Todos os campos são obrigatórios' });
+  }
 
   try {
-    // Verificar se o usuário já existe
-    console.log('Objeto auth antes de getUserByEmail:', auth);
-    const userRecord = await auth.getUserByEmail(email);
-    console.log('Objeto auth após getUserByEmail:', auth);
-
-    // Se o usuário existir, envie uma mensagem de erro
-    if (userRecord) {
-      res.status(400).json({ message: 'Este e-mail já está em uso. Por favor, use outro.' });
-      return;
-    }
-
-    // Se o usuário não existir, continue com o registro
+    let deviceId = accessToken
+    // Tente criar um usuário e capture qualquer erro
     const userCredential = await createUserWithEmailAndPassword(auth, email, password);
     const user = userCredential.user;
 
     // Atualizar o perfil do usuário com o nome fornecido
     await updateProfile(user, { displayName: name });
 
-    // Adicionar informações adicionais ao documento do usuário no Firestore
-    const userDocRef = doc(firestore, 'usuarios', user.uid);
-    await setDoc(userDocRef, {
+    // Adicionar informações adicionais ao nó do usuário no Realtime Database
+    const userRef = ref(database, `usuarios/${user.uid}`);
+    await set(userRef, {
       name,
       email,
-      createdAt: new Date()
+      createdAt: new Date().toISOString()
+    });
+
+    // Cria o nó "dispositivo" com o ID de dispositivo fornecido
+    const dispositivoRef = ref(database, `usuarios/${user.uid}/dispositivos/${deviceId}`);
+    await set(dispositivoRef, {});
+
+    // Cria o nó "dados" dentro do nó "dispositivo"
+    const dadosRef = ref(database, `usuarios/${user.uid}/dispositivos/${deviceId}/dados`);
+    await set(dadosRef, {});
+
+    // Cria o nó "tempoReal" dentro do nó "dados"
+    const tempoRealRef = ref(database, `usuarios/${user.uid}/dispositivos/${deviceId}/dados/tempoReal`);
+    await set(tempoRealRef, {});
+
+    // Adiciona as informações iniciais ao nó "tempoReal"
+    await set(tempoRealRef, {
+      MS: 0,
+      UA: 0,
+      TP: 0,
+      RL: false,
+      S1: 0,
+      S2: 0,
+      RG: false,
+      TIME: Date.now(),
+      HR: obterHorarioAtual(),
+      DAY: obterDataAtual()
     });
 
     res.json({ message: 'Usuário registrado com sucesso', user });
@@ -92,6 +137,7 @@ app.post('/api/v1/auth/register', async (req, res) => {
       errorMessage = 'O e-mail fornecido não é válido.';
     }
 
+    // Se o código de erro não for tratado, envie uma resposta de erro genérica
     res.status(500).json({ message: errorMessage });
   }
 });
@@ -113,56 +159,85 @@ app.post('/api/v1/auth/reset-password', async (req, res) => {
 
 // Rota para enviar dados ao Firestore do usuário
 app.post('/api/v1/realtime/data-receive', async (req, res) => {
+  const { getAuth } = require('firebase-admin/auth');
+
   const { userId, accessToken, MS, UA, TP, RL, S1, S2, RG } = req.body;
 
-  if (!userId || !accessToken || !MS || !UA || !TP || !RL || !S1 || !S2 || RG === undefined) {
+  if (!userId || !accessToken || !MS || !UA || !TP || !RL || !S1 || !S2 || !RG) {
     return res.status(400).json({ error: 'Todos os campos são obrigatórios' });
   }
 
   try {
-    const dadosDocRef = doc(firestore, 'usuarios', userId, 'dispositivos', accessToken, 'dados', 'tempoReal');
+    // Verificar se o usuário existe no Firebase Authentication
+    const auth = getAuth();
+    const userRecord = await auth.getUserByEmail(userId);
+    const uid = userRecord.uid;
 
-    const dataToUpdate = {
-      MS,
-      UA,
-      TP,
-      RL,
-      S1,
-      S2
-    };
+    // Continuar apenas se o usuário existir
+    if (uid) {
+      const dadosRef = ref(database, `usuarios/${uid}/dispositivos/${accessToken}/dados/tempoReal`);
 
-    // Verifica se o documento "dados" já existe
-    const dadosDoc = await getDoc(dadosDocRef);
+      const dataToUpdate = {
+        MS,
+        UA,
+        TP,
+        RL,
+        S1,
+        S2,
+        RG,
+        TIME: Date.now(),
+        HR: obterHorarioAtual(),
+        DAY: obterDataAtual()
+      };
 
-    // Se o documento "dados" não existir, cria o documento
-    if (!dadosDoc.exists()) {
-      await setDoc(dadosDocRef, {});
+      // Adiciona ou atualiza os dados no nó específico
+      await set(dadosRef, dataToUpdate);
+
+      // Se RG é verdadeiro, cria a coleção "alertas" e adiciona subdocumentos "irrigacao"
+      if (RG === 'true') {
+        const alertasRef = ref(database, `usuarios/${uid}/dispositivos/${accessToken}/dados/alertas`);
+
+        // Adiciona subdocumento com timestamp
+        const newSubdocRef = push(alertasRef);
+        await set(newSubdocRef, {
+          timestamp: Date.now(),
+          mensagem: 'Irrigação realizada'
+        });
+
+        console.log('Novo subdocumento de irrigação adicionado:', newSubdocRef.key);
+      }
+
+      res.sendStatus(200);
+    } else {
+      res.status(404).json({ message: 'Usuário não encontrado no Firebase Authentication' });
     }
-
-    // Adiciona ou atualiza os dados no documento "dados"
-    await setDoc(dadosDocRef, dataToUpdate, { merge: true });
-
-    // Se RG é verdadeiro, cria a coleção "alertas" e adiciona subdocumentos "irrigacao"
-    if (RG === 'true') {
-      const alertasCollectionRef = collection(firestore, 'usuarios', userId, 'dispositivos', accessToken, 'dados');
-      const irrigacaoDocRef = doc(alertasCollectionRef, 'alertas');
-
-      // Adiciona subdocumento com timestamp
-      const newSubdocRef = await addDoc(collection(irrigacaoDocRef, 'irrigacao'), {
-        timestamp: Date.now(),
-        mensagem: 'Irrigação realizada'
-      });
-
-      console.log('Novo subdocumento de irrigação adicionado:', newSubdocRef.id);
-    }
-
-    res.sendStatus(200);
   } catch (error) {
     console.error('Erro ao salvar dados do dispositivo:', error);
     res.status(500).json({ message: 'Erro interno do servidor' });
   }
-
 });
+
+function obterHorarioAtual() {
+  // Obtém a data e hora atual no fuso horário de São Paulo
+  var agora = new Date(Date.now());
+  var options = { timeZone: 'America/Sao_Paulo' };
+
+  // Obtém horas, minutos e segundos
+  var horas = agora.toLocaleString('pt-BR', options).split(' ')[1];
+
+  return horas;
+}
+
+function obterDataAtual() {
+  // Obtém a data e hora atual no fuso horário de São Paulo
+  var agora = new Date(Date.now());
+  var options = { timeZone: 'America/Sao_Paulo' };
+
+  // Obtém o dia, mês e ano
+  var dataFormatada = agora.toLocaleDateString('pt-BR', options);
+
+  return dataFormatada;
+}
 
 app.listen(PORT, () => {
   console.log(`Servidor rodando na porta ${PORT}`);
