@@ -1,5 +1,6 @@
 const express = require('express');
 const bodyParser = require('body-parser');
+const cors = require('cors');
 const { config } = require('dotenv');
 const { initializeApp } = require('firebase/app');
 const { getDatabase, ref, set, get, push } = require('firebase/database');
@@ -12,6 +13,7 @@ config();
 
 const app = express();
 const PORT = 8000;
+app.use(cors())
 
 // Configurar o Firebase
 const firebaseConfig = {
@@ -25,7 +27,6 @@ const firebaseConfig = {
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
-  databaseURL: 'https://seu-projeto-id.firebaseio.com', // Substitua pelo URL do seu banco de dados
 });
 
 const firebaseApp = initializeApp(firebaseConfig);
@@ -217,6 +218,54 @@ app.post('/api/v1/realtime/data-receive', async (req, res) => {
   }
 });
 
+// Rota para pegaros dados dos alertas
+app.post('/api/v1/realtime/alerts', async (req, res) => {
+  const { email, password } = req.body;
+
+  if (!email || !password) {
+    return res.status(400).json({ error: 'Todos os campos são obrigatórios' });
+  }
+
+  try {
+    // Autenticar usuário no Firebase
+    const userCredential = await signInWithEmailAndPassword(auth, email, password);
+    const user = userCredential.user;
+
+    // Buscar dados do usuário no Realtime Database usando o UID como identificador
+    const userSubCollectionRef = ref(database, `usuarios/${user.uid}/dispositivos`);
+    const userSubCollectionSnapshot = await get(userSubCollectionRef);
+
+    let userData = [];
+
+    if (userSubCollectionSnapshot.exists()) {
+      userSubCollectionSnapshot.forEach((childSnapshot) => {
+        const { dados } = childSnapshot.val();
+        const { alertas } = dados || {};
+
+        if (alertas) {
+          const alertasArray = Object.values(alertas).map((alerta) => {
+            const { mensagem, timestamp } = alerta;
+            const { day, time } = timestampToDateTime(timestamp);
+
+            return { mensagem, timestamp: { day, time } };
+          });
+
+          userData.push({ device: childSnapshot.key, alertas: alertasArray });
+        }
+      });
+    }
+
+    if (userData.length > 0) {
+      res.json({ message: 'Login bem-sucedido', userData });
+    } else {
+      res.status(404).json({ message: 'Dados do usuário não encontrados' });
+    }
+  } catch (error) {
+    console.error('Erro ao autenticar usuário:', error);
+    res.status(401).json({ message: 'Credenciais inválidas' });
+  }
+});
+
 function obterHorarioAtual() {
   // Obtém a data e hora atual no fuso horário de São Paulo
   var agora = new Date(Date.now());
@@ -238,6 +287,16 @@ function obterDataAtual() {
 
   return dataFormatada;
 }
+
+const timestampToDateTime = (timestamp) => {
+  const date = new Date(timestamp);
+  const options = { timeZone: 'America/Sao_Paulo' };
+
+  const day = date.toLocaleDateString('pt-BR', { day: '2-digit', month: '2-digit', year: 'numeric', ...options });
+  const time = date.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit', second: '2-digit', ...options });
+
+  return { day, time };
+};
 
 app.listen(PORT, () => {
   console.log(`Servidor rodando na porta ${PORT}`);
